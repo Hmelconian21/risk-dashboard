@@ -14,6 +14,8 @@ Run: streamlit run app.py
 """
 
 import logging
+import re
+import urllib.request
 
 import altair as alt
 import pandas as pd
@@ -26,6 +28,30 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)  # bad tickers get a fr
 
 RISK_FREE_RATE = 0.045      # annual, for the Sharpe ratio (~ 10yr Treasury)
 VAR_CONFIDENCE = 0.95
+
+# Broad index funds are diversified on their own, so a big weight in one isn't
+# the single-name concentration the warning is meant to catch.
+BROAD_INDEX_ETFS = {
+    "SPY", "VOO", "IVV", "SPLG", "VTI", "ITOT", "SCHB", "QQQ", "QQQM", "DIA", "IWM", "IWB", "IWV", "RSP",
+    "VT", "ACWI", "VEA", "VXUS", "IEFA", "EFA", "VWO", "IEMG", "EEM",
+    "AGG", "BND", "BNDX", "IUSB", "SCHZ", "TLT", "IEF", "SHY", "GOVT",
+}
+
+SCREENER_REPO ="https://github.com/Hmelconian21/Stock-Research-System"
+SCREENER_URL = ("https://raw.githubusercontent.com/Hmelconian21/Stock-Research-System/"
+                "main/screener/screener_results.txt")
+SCREENER_TOP_N = 10
+# Used when the live file can't be fetched (top 10 as of 2026-10-06).
+SCREENER_SNAPSHOT = ["MU", "CF", "HIG", "EXPE", "SNDK", "WYNN", "DAL", "DECK", "COF", "ALB"]
+
+CUSTOM = "Custom"
+SCREENER_PRESET = "Top 10 from my Stock Research System screener"
+PRESETS = {  # name -> {ticker: weight %}; the screener and custom ones are filled in at runtime
+    CUSTOM: None,
+    "60/40 (SPY/AGG)": {"SPY": 60, "AGG": 40},
+    "All tech (AAPL, MSFT, NVDA, GOOGL, META)": {t: 20 for t in ["AAPL", "MSFT", "NVDA", "GOOGL", "META"]},
+    SCREENER_PRESET: None,
+}
 
 # Chart colors (reference data-viz palette). Light and dark are separate
 # steps of the same hues, picked to suit each background.
@@ -67,7 +93,24 @@ def sample_portfolio() -> pd.DataFrame:
     else:
         total = sum(values.values())
         weights = {t: v / total * 100 for t, v in values.items()}
-    return pd.DataFrame({"Ticker": list(weights), "Weight (%)": [round(w, 1) for w in weights.values()]})
+    return weights_frame(weights)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def screener_top_tickers(n: int = SCREENER_TOP_N) -> list[str]:
+    """The top n tickers from the screener's ranked list ("#1  MU  |  score: ...").
+    Raises on failure so the caller falls back to the snapshot and a
+    network blip isn't cached for an hour."""
+    with urllib.request.urlopen(SCREENER_URL, timeout=10) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+    tickers = re.findall(r"^#\d+\s+([A-Z][A-Z0-9.\-]*)\s+\|", text, flags=re.MULTILINE)
+    if len(tickers) < n:
+        raise ValueError(f"only found {len(tickers)} ranked tickers")
+    return [t.replace(".", "-") for t in tickers[:n]]  # yfinance spells BRK.B as BRK-B
+
+
+def weights_frame(weights: dict) -> pd.DataFrame:
+    return pd.DataFrame({"Ticker": list(weights), "Weight (%)": [round(float(w), 1) for w in weights.values()]})
 
 
 # --------------------------------------------------------------------------
@@ -85,8 +128,17 @@ def compute_metrics(returns: pd.DataFrame, weights: dict, benchmark: str) -> dic
     wealth = (1 + port).cumprod()
     drawdown = wealth / wealth.cummax() - 1
 
+    # Euler decomposition: each holding's share of portfolio volatility is
+    # w_i * (Cov w)_i / (w' Cov w). The shares add up to 100%, and a holding
+    # that hedges the rest can come out negative.
+    w = pd.Series(weights)
+    cov = returns[holdings].cov()
+    port_var = float(w @ cov @ w)
+    risk_share = w * (cov @ w) / port_var if port_var else w * 0
+
     per_ticker = pd.DataFrame({
-        "Weight": pd.Series(weights),
+        "Weight": w,
+        "Risk contribution": risk_share,
         "Ann. volatility": returns[holdings].std() * rd.TRADING_DAYS ** 0.5,
         "Beta": pd.Series({t: linregress(bench, returns[t]).slope for t in holdings}),
     })
@@ -167,6 +219,40 @@ def correlation_chart(corr: pd.DataFrame, c: dict) -> alt.LayerChart:
     return (rect + text).properties(width=alt.Step(64), height=alt.Step(64))
 
 
+def risk_contribution_chart(per_ticker: pd.DataFrame, c: dict) -> alt.LayerChart:
+    """Weight next to share of risk for each holding, biggest risk first."""
+    order = list(per_ticker.sort_values("Risk contribution", ascending=False).index)
+    series = ["Weight", "Risk contribution"]
+    long = (per_ticker[series].reset_index(names="Ticker")
+            .melt("Ticker", var_name="Measure", value_name="Share"))
+    y = alt.Y("Ticker:N", sort=order, title=None, scale=alt.Scale(paddingInner=0.3))
+    base = alt.Chart(long).encode(
+        y=y,
+        yOffset=alt.YOffset("Measure:N", sort=series, scale=alt.Scale(paddingInner=0.15)),
+        x=alt.X("Share:Q", title="Share of portfolio", axis=alt.Axis(format="%", grid=True)),
+        color=alt.Color("Measure:N", scale=alt.Scale(domain=series, range=[c["muted"], c["portfolio"]]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=[alt.Tooltip("Ticker:N"), alt.Tooltip("Measure:N"), alt.Tooltip("Share:Q", format=".1%")],
+    )
+    bars = base.mark_bar(cornerRadiusEnd=4)
+    labels = base.mark_text(align="left", dx=4, fontSize=11, color=c["ink"]).encode(
+        text=alt.Text("Share:Q", format=".0%"), color=alt.value(c["ink"]),
+    )
+    return (bars + labels).properties(height=alt.Step(14))
+
+
+def risk_takeaway(per_ticker: pd.DataFrame) -> str:
+    """One line on the holding whose share of risk most outruns its weight."""
+    gap = per_ticker["Risk contribution"] - per_ticker["Weight"]
+    t = gap.idxmax()
+    w, r = per_ticker.loc[t, "Weight"], per_ticker.loc[t, "Risk contribution"]
+    if len(per_ticker) < 2:
+        return f"{t} is the whole portfolio, so it carries all of the risk."
+    if gap[t] < 0.02:
+        return "Risk is spread roughly in line with the weights; no holding punches far above its size."
+    return f"**{t}** is {w:.0%} of weight but {r:.0%} of risk."
+
+
 # --------------------------------------------------------------------------
 # Page
 # --------------------------------------------------------------------------
@@ -194,17 +280,30 @@ def main() -> None:
 
     st.sidebar.header("Portfolio")
     benchmark = st.sidebar.text_input("Benchmark", rd.DEFAULT_BENCHMARK).strip().upper() or rd.DEFAULT_BENCHMARK
-    with st.spinner("Loading sample portfolio..."):
-        default = sample_portfolio()
+    preset = st.sidebar.selectbox("Preset", list(PRESETS))
+    if preset == CUSTOM:
+        with st.spinner("Loading sample portfolio..."):
+            default = sample_portfolio()
+    elif preset == SCREENER_PRESET:
+        try:
+            tickers, source = screener_top_tickers(), "live screener results"
+        except Exception:  # network, HTTP or parse failure -> snapshot
+            tickers, source = SCREENER_SNAPSHOT, "a saved snapshot (the live file couldn't be fetched)"
+        default = weights_frame({t: 100 / len(tickers) for t in tickers})
+        st.sidebar.caption(f"Equal-weighted top {len(tickers)} from [Stock Research System]"
+                           f"({SCREENER_REPO}), using {source}.")
+    else:
+        default = weights_frame(PRESETS[preset])
     edited = st.sidebar.data_editor(
         default, num_rows="dynamic", hide_index=True, width="stretch",
+        key=f"portfolio_{preset}",  # switching presets resets the table
         column_config={
             "Ticker": st.column_config.TextColumn(required=True),
             "Weight (%)": st.column_config.NumberColumn(min_value=0.0, max_value=100.0, step=0.5, format="%.1f%%"),
         },
     )
-    st.sidebar.caption("Weights are rescaled to add up to 100%. The sample portfolio is "
-                       "positions.csv valued at the latest close.")
+    st.sidebar.caption("Edit any preset freely. Weights are rescaled to add up to 100%. "
+                       "Custom starts from positions.csv valued at the latest close.")
 
     st.title("Portfolio risk")
     raw_weights, problems = read_portfolio(edited)
@@ -257,10 +356,20 @@ def main() -> None:
     cols[4].metric(f"1-day VaR ({VAR_CONFIDENCE:.0%})", f"{m['var_pct']:.1%}",
                    help="Parametric (normal) estimate: on 95% of days the loss should be smaller "
                         "than this. Real returns have fatter tails, so treat it as a floor.")
+    explanations = [
+        "How much the portfolio's value typically swings over a year; higher means a bumpier ride.",
+        "The worst drop from a high point to a later low over the period.",
+        f"A beta of {m['beta']:.2f} means the portfolio tends to move about {abs(m['beta']):.2f}% "
+        f"when {benchmark} moves 1%.",
+        "How much return you got for each unit of risk taken; above 1 is generally considered good.",
+        f"On a typical bad day (1 in 20), expect to lose about {m['var_pct']:.1%} or more.",
+    ]
+    for col, text in zip(cols, explanations):
+        col.caption(text)
     st.caption(f"Based on {m['days']} overlapping trading days over the last "
                f"{rd.HISTORY_PERIOD}. Annualized return: {m['ann_return']:+.1%}. Not investment advice.")
 
-    concentrated = [t for t, w in weights.items() if w > rd.CONCENTRATION_WARN]
+    concentrated = [t for t, w in weights.items() if w > rd.CONCENTRATION_WARN and t not in BROAD_INDEX_ETFS]
     if concentrated:
         st.warning(f"⚠ Over {rd.CONCENTRATION_WARN:.0%} of the portfolio: " +
                    ", ".join(f"{t} ({weights[t]:.1%})" for t in concentrated))
@@ -280,9 +389,17 @@ def main() -> None:
             with st.expander("Show data"):
                 st.dataframe(m["corr"].style.format("{:.2f}"), width="stretch")
 
+    st.subheader("Risk contribution by holding")
+    st.markdown(risk_takeaway(m["per_ticker"]))
+    st.caption("Each holding's share of the portfolio's total volatility (weight × its marginal "
+               "contribution, from the covariance matrix). Volatile holdings that move together "
+               "take up more of the risk than their weight suggests.")
+    st.altair_chart(risk_contribution_chart(m["per_ticker"], c), width="stretch")
+
     st.subheader("Holdings")
     st.dataframe(
-        m["per_ticker"].style.format({"Weight": "{:.1%}", "Ann. volatility": "{:.1%}", "Beta": "{:.2f}"}),
+        m["per_ticker"].style.format({"Weight": "{:.1%}", "Risk contribution": "{:.1%}",
+                                      "Ann. volatility": "{:.1%}", "Beta": "{:.2f}"}),
         width="stretch",
     )
 
