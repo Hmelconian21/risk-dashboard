@@ -2,7 +2,7 @@
 
 [Try the live demo](https://henry-risk-dashboard.streamlit.app)
 
-![Streamlit app showing risk metrics, cumulative return vs SPY, and a correlation heatmap](assets/app-screenshot.png)
+![Streamlit app with the Stock Research System screener preset selected, showing a risk contribution chart where SNDK is 10% of weight but 29% of risk](assets/app-screenshot.png)
 
 Portfolio risk report from a `ticker,shares` CSV: concentration, annualized volatility, beta, and 1-day Value-at-Risk computed from a year of daily returns.
 
